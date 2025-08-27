@@ -1,0 +1,19 @@
+name: geoapps-docs
+
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - ipywidgets
+  - ipykernel
+  - pandoc
+  - pip:
+    - numpydoc
+    - jinja2
+    - sphinx
+    - sphinx_issues
+    - nbsphinx
+    - sphinx-gallery
+    - jupyter_sphinx
+    - plotly

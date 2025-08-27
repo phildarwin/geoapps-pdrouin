@@ -1,0 +1,108 @@
+
+default_language_version:
+    python: python3
+exclude: (^docs/(conf.py|_ext/))
+default_stages: [pre-commit,pre-push]
+fail_fast: false
+
+ci:
+    skip: [pylint]
+    autoupdate_branch: develop
+    autoupdate_schedule: monthly
+
+repos:
+-   repo: https://github.com/hadialqattan/pycln
+    rev: v2.5.0
+    hooks:
+    -   id: pycln
+        args: [--config=pyproject.toml]
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.1
+    hooks:
+    -   id: ruff
+        args:
+        -   --fix
+        -   --exit-non-zero-on-fix
+#        -   --unsafe-fixes
+        exclude_types: [jupyter]
+    -   id: ruff-format
+        exclude_types: [jupyter]
+#-   repo: https://github.com/pre-commit/mirrors-mypy  # TODO: fix mypy errors
+#    rev: v1.10.0
+#    hooks:
+#    -   id: mypy
+#        additional_dependencies: [
+#            numpy==1.26.*,
+#            types-toml,
+#            types-PyYAML,
+#            tomli  # to read config from pyproject.toml
+#        ]
+#        exclude: ^(docs|geoapps-assets)/
+-   repo: https://github.com/codingjoe/relint
+    rev: 3.3.1
+    hooks:
+    -   id: relint
+        args: [-W]  # to fail on warnings
+-   repo: https://github.com/MiraGeoscience/pre-commit-hooks
+    rev: v1.1.0
+    hooks:
+    -   id: check-copyright
+        files: (^package\.rst|^LICENSE|^README(|-dev)\.rst|\.py|\.pyi)$
+        exclude: (^\.|^docs/)
+    -   id: prepare-commit-msg
+    -   id: check-commit-msg
+-   repo: local
+    hooks:
+    -   id: pylint
+        name: pylint
+        entry: .\\devtools\\conda_env_pylint.bat
+        language: system
+        require_serial: true  # pylint does its own parallelism
+        types: [python]
+        exclude: ^(devtools|docs)/
+-   repo: https://github.com/codespell-project/codespell
+    rev: v2.3.0
+    hooks:
+    -   id: codespell
+        exclude: (-lock\.ya?ml|\benvironments/.*\.ya?ml|\.ipynb|^THIRD_PARTY_SOFTWARE\.rst)$
+        entry: codespell -I .codespellignore
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+    -   id: trailing-whitespace
+        exclude: \.mdj$
+    -   id: check-json
+        exclude_types: [jupyter]
+    -   id: check-toml
+    -   id: check-yaml
+    -   id: check-added-large-files
+#        args: [--enforce-all]
+    -   id: check-case-conflict
+    -   id: check-merge-conflict
+    -   id: debug-statements
+    -   id: detect-private-key
+    -   id: end-of-file-fixer
+        exclude: (^\.idea/.*\.xml|\.mdj)$
+    -   id: mixed-line-ending
+        exclude: ^\.idea/.*\.xml$
+    -   id: name-tests-test
+    -   id: pretty-format-json
+        args:
+            - --autofix
+            - --indent=4
+            - --no-sort-keys
+            - --top-keys
+            - version,title,icon,documentation,conda_environment,run_command,geoh5,monitoring_directory,workspace_geoh5
+        exclude_types: [jupyter]
+        exclude: ^docs/.*/images/
+-   repo: https://github.com/rstcheck/rstcheck
+    rev: v6.2.4
+    hooks:
+    -   id: rstcheck
+        exclude: ^THIRD_PARTY_SOFTWARE.rst$
+        additional_dependencies: [sphinx]
+-   repo: https://github.com/pre-commit/pygrep-hooks
+    rev: v1.10.0
+    hooks:
+    -   id: rst-backticks
+        exclude: ^THIRD_PARTY_SOFTWARE.rst$
