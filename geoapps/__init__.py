@@ -37,6 +37,7 @@ def assets_path() -> Path:
     return assets_folder
 
 
+
 # Import main app classes for easy access
 from .calculator import Calculator
 from .curve_with_strike_dip_to_surface import CurveWithStrikeDipToSurface
