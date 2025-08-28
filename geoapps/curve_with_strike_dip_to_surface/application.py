@@ -16,6 +16,7 @@ from uuid import UUID
 from geoh5py.ui_json.utils import monitored_directory_copy
 from geoh5py.objects.points import Points
 from geoh5py.objects.curve import Curve
+from geoh5py.objects.surface import Surface
 
 from geoapps import assets_path
 from geoapps.base.selection import ObjectDataSelection
@@ -59,8 +60,7 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
         self._dip_property = Dropdown(description="Dip Property:")
 
         # Surface generation parameters
-        self._projection_distance = FloatText(100.0, description="Projection Distance (m):", min=0.1, max=10000.0)
-        self._z_offset = FloatText(50.0, description="Z Offset for Bottom:", min=0.1, max=1000.0)
+        self._projection_distance = FloatText(500.0, description="Projection Distance (m):", min=0.1, max=10000.0)
 
         # Action buttons
         self._process_curve = Button(description="Process Curve", button_style='success')
@@ -73,6 +73,10 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
 
         # Output area for messages
         self._output_area = Output()
+
+        # Initialize projected surface data
+        self._projected_surface_vertices = None
+        self._projected_surface_cells = None
 
         # Connect button events
         self._create_point.on_click(self.create_point_click)
@@ -107,7 +111,6 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
                     self._dip_property,
                     HTML("<h4>Surface Parameters:</h4>"),
                     self._projection_distance,
-                    self._z_offset,
                     HBox([self._process_curve, self._export_surface]),
                     HTML("<h4>Point Creation:</h4>"),
                     HBox([self._point_name]),
@@ -309,32 +312,142 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
                 self.log_message(f"🔍 Details: {traceback.format_exc()}", "error")
 
     def process_curve_click(self, _):
-        """Process the selected curve with chosen properties"""
+        """Process the selected curve by projecting segments downward using strike/dip"""
         try:
+            if self.workspace is None:
+                self.log_message("No workspace available", "error")
+                return
+                
             if not self._available_curves.value:
                 self.log_message("No curve selected", "warning")
                 return
 
-            if not all([self._litho_property.value, self._order_property.value,
-                       self._strike_property.value, self._dip_property.value]):
-                self.log_message("Please select all 4 properties (litho, order, strike, dip)", "warning")
+            self.log_message("🔄 Processing curve segments...", "info")
+
+            # Get the selected curve
+            curve_uid = self._available_curves.value
+            curve = self.workspace.get_entity(curve_uid)[0]
+
+            # Get the selected curve
+            curve_uid = self._available_curves.value
+            curve = self.workspace.get_entity(curve_uid)[0]
+            
+            if curve is None or not isinstance(curve, Curve):
+                self.log_message("Invalid curve selected", "error")
                 return
 
-            self.log_message("🔄 Processing curve with selected properties...", "info")
-            self.log_message(f"📊 Litho: {self._litho_property.value}", "info")
-            self.log_message(f"📊 Order: {self._order_property.value}", "info")
-            self.log_message(f"📊 Strike: {self._strike_property.value}", "info")
-            self.log_message(f"📊 Dip: {self._dip_property.value}", "info")
+            # Get curve vertices
+            if not hasattr(curve, 'vertices') or curve.vertices is None:
+                self.log_message("Curve has no vertices", "error")
+                return
+                
+            vertices = curve.vertices
+            self.log_message(f"📊 Curve has {len(vertices)} vertices", "info")
 
-            # TODO: Add actual curve processing logic here
-            # This would involve:
-            # 1. Getting the curve data
-            # 2. Extracting the selected properties
-            # 3. Processing strike/dip to surface conversion
-            # 4. Creating surface object
+            # Get strike and dip data
+            strike_data = None
+            dip_data = None
+            
+            if hasattr(curve, 'get_data_list') and curve.get_data_list():
+                for data_name in curve.get_data_list():
+                    if data_name.lower() == 'strike':
+                        strike_data = curve.get_data(data_name)[0].values
+                    elif data_name.lower() == 'dip':
+                        dip_data = curve.get_data(data_name)[0].values
 
-            self.log_message("✅ Curve processing completed!", "success")
-            self.log_message("💡 Click 'Export to Surface' to save the result", "info")
+            if strike_data is None or dip_data is None:
+                self.log_message("❌ Strike or dip data not found on curve", "error")
+                return
+
+            # Project each segment downward and create surfaces
+            projected_points = []
+            surface_cells = []  # Store surface connectivity
+            projection_distance = 500.0  # Default 500m projection
+            
+            # Project all vertices first
+            projected_vertices = []
+            for i, vertex in enumerate(vertices):
+                # Get strike/dip at this vertex
+                strike_deg = float(strike_data[i])
+                dip_deg = float(dip_data[i])
+                
+                # Convert to radians
+                strike_rad = np.radians(strike_deg)
+                dip_rad = np.radians(dip_deg)
+                
+                # Calculate projection direction (perpendicular to strike, downward)
+                strike_dir = np.array([np.sin(strike_rad), np.cos(strike_rad), 0])
+                perp_dir = np.array([-np.cos(strike_rad), np.sin(strike_rad), 0])
+                
+                # Apply dip (tilt downward)
+                dip_factor = np.sin(dip_rad)
+                horizontal_factor = np.cos(dip_rad)
+                
+                # Final projection direction
+                proj_dir = horizontal_factor * perp_dir + dip_factor * np.array([0, 0, -1])
+                proj_dir = proj_dir / np.linalg.norm(proj_dir)  # Normalize
+                
+                # Project the point
+                proj_point = vertex + projection_distance * proj_dir
+                projected_vertices.append(proj_point)
+                
+                self.log_message(f"� Point {i+1}: strike={strike_deg:.1f}°, dip={dip_deg:.1f}°", "info")
+            
+            projected_vertices = np.array(projected_vertices)
+            
+            # Create top surface (original curve)
+            if len(vertices) >= 3:
+                # Calculate center point for top surface
+                top_center = np.mean(vertices, axis=0)
+                all_vertices = np.vstack([vertices, projected_vertices, top_center])
+                top_center_idx = len(vertices) + len(projected_vertices)
+                
+                # Create triangles from center to each edge
+                for i in range(len(vertices)):
+                    surface_cells.append([i, (i + 1) % len(vertices), top_center_idx])
+                
+                self.log_message(f"✅ Created top surface with {len(vertices)} triangles", "info")
+            
+            # Create bottom surface (projected curve)
+            if len(projected_vertices) >= 3:
+                # Calculate center point for bottom surface
+                bottom_center = np.mean(projected_vertices, axis=0)
+                all_vertices = np.vstack([all_vertices, bottom_center])
+                bottom_center_idx = len(all_vertices) - 1
+                
+                # Create triangles from center to each edge
+                for i in range(len(projected_vertices)):
+                    surface_cells.append([len(vertices) + i, len(vertices) + ((i + 1) % len(projected_vertices)), bottom_center_idx])
+                
+                self.log_message(f"✅ Created bottom surface with {len(projected_vertices)} triangles", "info")
+            
+            # Create side surfaces between consecutive points (including last to first)
+            for i in range(len(vertices)):
+                # Get the four corners of each surface quad
+                top_left = i
+                top_right = (i + 1) % len(vertices)  # Wrap around to first point
+                bottom_left = i + len(vertices)
+                bottom_right = ((i + 1) % len(vertices)) + len(vertices)
+                
+                # Create two triangles for each quad (2 points, 2 triangles per pair)
+                surface_cells.extend([
+                    [top_left, top_right, bottom_right],      # First triangle
+                    [top_left, bottom_right, bottom_left]     # Second triangle
+                ])
+            
+            self.log_message(f"✅ Created {len(vertices)} side surfaces with 2 triangles each", "info")
+            
+            if all_vertices.size > 0 and surface_cells:
+                total_triangles = len(surface_cells)
+                self.log_message(f"📊 Created complete closed surface with {len(all_vertices)} vertices and {total_triangles} triangles", "info")
+                
+                # Store the surface data for export
+                self._projected_surface_vertices = all_vertices
+                self._projected_surface_cells = np.array(surface_cells)
+                self.log_message("✅ Curve processing completed!", "success")
+                self.log_message("💡 Click 'Export to Surface' to save the result", "info")
+            else:
+                self.log_message("❌ No surfaces were created", "error")
 
         except Exception as e:
             self.log_message(f"❌ Error processing curve: {e}", "error")
@@ -342,90 +455,39 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
             self.log_message(f"🔍 Details: {traceback.format_exc()}", "error")
 
     def export_surface_click(self, _):
-        """Export processed curve to surface"""
+        """Export projected surface to workspace"""
         try:
-            if not self._available_curves.value:
-                self.log_message("No curve selected", "warning")
+            if self._projected_surface_vertices is None or self._projected_surface_cells is None:
+                self.log_message("No projected surface data available. Process a curve first.", "warning")
                 return
 
-            self.log_message("🔄 Exporting curve to surface...", "info")
+            self.log_message("🔄 Exporting projected surface...", "info")
 
             # Create output workspace
-            temp_geoh5 = f"surface_from_curve_{time():.0f}.geoh5"
+            temp_geoh5 = f"projected_surface_{time():.0f}.geoh5"
             export_path = self.export_directory.selected_path or "."
             ws, live_link_status = self.get_output_workspace(
                 self.live_link.value, export_path, temp_geoh5
             )
 
             with ws as workspace:
-                # Check if we have a valid workspace and curve
-                if self.workspace is None:
-                    raise ValueError("No source workspace available")
-
-                # Get the selected curve and its data
-                curve_uid = self._available_curves.value
-                if curve_uid is None:
-                    raise ValueError("No curve selected")
-
-                curve = self.workspace.get_entity(curve_uid)[0]
-                if curve is None or not isinstance(curve, Curve):
-                    raise ValueError("Invalid curve selected")
-
-                # Get strike and dip data for all points
-                if self._strike_property.value is None or self._dip_property.value is None:
-                    raise ValueError("Strike and dip data are required for surface generation")
-
-                # Find the data objects for selected properties
-                strike_data = None
-                dip_data = None
-
-                for data_obj in self.workspace.data:
-                    if data_obj.name == self._strike_property.value:
-                        strike_data = data_obj
-                    elif data_obj.name == self._dip_property.value:
-                        dip_data = data_obj
-
-                if strike_data is None or dip_data is None:
-                    raise ValueError("Strike and dip data are required for surface generation")
-
-                # Get curve vertices safely
-                try:
-                    if hasattr(curve, 'vertices') and curve.vertices is not None:
-                        curve_vertices = curve.vertices.copy()
-                        self.log_message(f"✅ Retrieved {len(curve_vertices)} curve vertices", "info")
-                    else:
-                        raise ValueError("Curve has no vertices")
-                except Exception as vert_error:
-                    raise ValueError(f"Could not access curve vertices: {vert_error}")
-
-                # Get projection parameters
-                projection_distance = self._projection_distance.value
-                z_offset = self._z_offset.value
-
-                if projection_distance <= 0:
-                    raise ValueError("Projection distance must be positive")
-                if z_offset <= 0:
-                    raise ValueError("Z offset must be positive")
-
-                # Step 1: Project all points downward to reach Z offset
-                self.log_message("🔄 Projecting points to bottom surface...", "info")
-                bottom_vertices = self._project_all_points_to_z_offset(
-                    curve_vertices, strike_data.values, dip_data.values, z_offset
+                # Create a Surface object with the projected surface
+                surface_obj = Surface.create(
+                    workspace,
+                    name=f"Projected_Surface_{time():.0f}",
+                    vertices=self._projected_surface_vertices,
+                    cells=self._projected_surface_cells
                 )
-
-                # Step 2: Create a single closed surface containing top, bottom, and all sides
-                self.log_message("🔄 Creating complete closed surface...", "info")
-                closed_surface = self._create_closed_volume_surface(workspace, curve_vertices, bottom_vertices, curve)
-
-                # Export the single closed surface via live link
+                
+                self.log_message(f"✅ Created surface with {len(self._projected_surface_vertices)} vertices and {len(self._projected_surface_cells)} triangles", "success")
+                
+                # Export via live link if active
                 if live_link_status:
-                    self.log_message("Live link active - exporting closed surface to Geoscience ANALYST", "success")
-                    monitored_directory_copy(export_path, closed_surface)
-                    self.log_message("✅ Complete closed surface exported", "info")
+                    self.log_message("Live link active - exporting to Geoscience ANALYST", "success")
+                    monitored_directory_copy(export_path, surface_obj)
+                    self.log_message("✅ Surface exported", "info")
                 else:
-                    self.log_message("Closed surface saved to file", "info")
-
-                self.log_message("✅ Complete 3D closed volume created!", "success")
+                    self.log_message("Surface saved to file", "info")
 
         except Exception as e:
             self.log_message(f"❌ Error exporting surface: {e}", "error")
@@ -504,116 +566,3 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
         ])
 
         return projected_point
-
-    def _project_all_points_to_z_offset(self, curve_vertices, strike_values, dip_values, z_offset):
-        """
-        Project all curve points downward along their strike/dip until Z decreases by z_offset.
-
-        Args:
-            curve_vertices: Original curve vertices
-            strike_values: Strike values for each point
-            dip_values: Dip values for each point
-            z_offset: Target Z decrease
-
-        Returns:
-            Projected vertices with Z offset
-        """
-        projected_vertices = []
-
-        for i, point in enumerate(curve_vertices):
-            try:
-                strike_deg = float(strike_values[i])
-                dip_deg = float(dip_values[i])
-
-                # Calculate how far to project to achieve the Z offset
-                # Z component of the dip direction
-                import math
-                dip_rad = math.radians(dip_deg)
-                z_component = -math.cos(dip_rad)  # Negative for downward
-
-                if abs(z_component) < 1e-10:
-                    # Vertical dip, use a small fixed distance
-                    distance = z_offset
-                else:
-                    # Calculate distance needed to achieve z_offset
-                    distance = z_offset / abs(z_component)
-
-                # Project the point
-                projected_point = self._project_point_downward(point, strike_deg, dip_deg, distance)
-                projected_vertices.append(projected_point)
-
-            except (IndexError, ValueError, TypeError) as e:
-                self.log_message(f"⚠️ Error projecting point {i}: {e}, using original point", "warning")
-                projected_vertices.append(point.copy())
-
-        return np.array(projected_vertices)
-
-    def _create_closed_volume_surface(self, workspace, top_vertices, bottom_vertices, curve):
-        """
-        Create a single closed surface containing top, bottom, and all sides.
-
-        Args:
-            workspace: The geoh5 workspace
-            top_vertices: Vertices of the top curve
-            bottom_vertices: Vertices of the bottom curve
-            curve: The original curve object
-
-        Returns:
-            Single Surface object representing the complete closed volume
-        """
-        from geoh5py.objects.surface import Surface
-
-        # Combine all vertices: top curve + bottom curve
-        all_vertices = np.vstack([top_vertices, bottom_vertices])
-
-        # Create cells for the complete closed surface
-        cells = []
-        n_top_points = len(top_vertices)
-        n_bottom_points = len(bottom_vertices)
-
-        # 1. Top surface (triangulated)
-        if n_top_points >= 3:
-            # Calculate center point for top surface
-            top_center = np.mean(top_vertices, axis=0)
-            all_vertices = np.vstack([all_vertices, top_center])
-            top_center_idx = len(all_vertices) - 1
-
-            # Create triangles from center to each edge
-            for i in range(n_top_points):
-                cells.append([i, (i + 1) % n_top_points, top_center_idx])
-
-        # 2. Bottom surface (triangulated)
-        if n_bottom_points >= 3:
-            # Calculate center point for bottom surface
-            bottom_center = np.mean(bottom_vertices, axis=0)
-            all_vertices = np.vstack([all_vertices, bottom_center])
-            bottom_center_idx = len(all_vertices) - 1
-
-            # Create triangles from center to each edge
-            for i in range(n_bottom_points):
-                cells.append([n_top_points + i, n_top_points + ((i + 1) % n_bottom_points), bottom_center_idx])
-
-        # 3. Side surfaces (including closing side from last to first)
-        for i in range(n_top_points):
-            # Get the four corner points for this side segment
-            top_left = i
-            top_right = (i + 1) % n_top_points  # This ensures closing side
-            bottom_left = n_top_points + i
-            bottom_right = n_top_points + ((i + 1) % n_bottom_points)
-
-            # Create two triangles to form the quadrilateral
-            cells.append([top_left, top_right, bottom_left])      # Triangle 1
-            cells.append([top_right, bottom_right, bottom_left])  # Triangle 2
-
-        surface_cells = np.array(cells, dtype=np.int32)
-
-        # Create the single closed surface
-        surface_name = f"Closed_Volume_{getattr(curve, 'name', 'Curve')}"
-        closed_surface = Surface.create(
-            workspace,
-            name=surface_name,
-            vertices=all_vertices,
-            cells=surface_cells
-        )
-
-        return closed_surface
