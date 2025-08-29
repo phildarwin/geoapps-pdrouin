@@ -17,6 +17,7 @@ from geoh5py.ui_json.utils import monitored_directory_copy
 from geoh5py.objects.points import Points
 from geoh5py.objects.curve import Curve
 from geoh5py.objects.surface import Surface
+from geoh5py.objects.block_model import BlockModel
 
 from geoapps import assets_path
 from geoapps.base.selection import ObjectDataSelection
@@ -25,6 +26,8 @@ from geoapps.utils import warn_module_not_found
 
 with warn_module_not_found():
     from ipywidgets.widgets import Button, HBox, Layout, Text, VBox, FloatText, Label, Output, HTML, Dropdown, SelectMultiple
+    from scipy.spatial import Delaunay
+    import trimesh
 
 
 app_initializer = {
@@ -52,6 +55,11 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
         # Curve selection - multiple curves
         self._available_curves = SelectMultiple(description="Select Curves:")
         self._refresh_curves = Button(description="Refresh Curves", button_style='info')
+
+        # Block model selection
+        self._available_block_models = SelectMultiple(description="Select Block Model:")
+        self._refresh_block_models = Button(description="Refresh Block Models", button_style='info')
+        self._update_block_model = Button(description="Update Block Model", button_style='primary')
 
         # Property selection (shown after curve selection)
         self._litho_property = Dropdown(description="Litho Property:")
@@ -82,6 +90,8 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
         self._test_live_link.on_click(self.test_live_link_click)
         self._clear_output.on_click(self.clear_output_click)
         self._refresh_curves.on_click(self.refresh_curves_click)
+        self._refresh_block_models.on_click(self.refresh_block_models_click)
+        self._update_block_model.on_click(self.update_block_model_click)
         self._process_curve.on_click(self.process_curve_click)
         self._export_surface.on_click(self.export_surface_click)
 
@@ -93,6 +103,9 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
         # Initialize curve list
         self.refresh_curves_click(None)
 
+        # Initialize block model list
+        self.refresh_block_models_click(None)
+
     @property
     def main(self):
         if self._main is None:
@@ -102,9 +115,12 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
                     HTML("<h4>Curve Selection:</h4>"),
                     HBox([self._refresh_curves]),
                     self._available_curves,
+                    HTML("<h4>Block Model Selection:</h4>"),
+                    HBox([self._refresh_block_models]),
+                    self._available_block_models,
                     HTML("<h4>Surface Parameters:</h4>"),
                     self._projection_distance,
-                    HBox([self._process_curve, self._export_surface]),
+                    HBox([self._process_curve, self._export_surface, self._update_block_model]),
                     HTML("<h4>Point Creation:</h4>"),
                     HBox([self._point_name]),
                     HBox([self._x_coord, self._y_coord, self._z_coord]),
@@ -221,6 +237,298 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
             self.log_message(f"❌ Error refreshing curves: {e}", "error")
             import traceback
             self.log_message(f"🔍 Details: {traceback.format_exc()}", "error")
+
+    def refresh_block_models_click(self, _):
+        """Refresh the list of available block models from the workspace"""
+        try:
+            if self.workspace is None:
+                self.log_message("No workspace loaded. Please select a project first.", "warning")
+                return
+
+            # Get all block model objects from the workspace
+            block_models = []
+            for obj in self.workspace.objects:
+                if isinstance(obj, BlockModel):
+                    block_models.append((f"{obj.name} ({obj.uid})", obj.uid))
+
+            if block_models:
+                self._available_block_models.options = block_models
+                self._available_block_models.value = ()  # Empty tuple for SelectMultiple
+                self.log_message(f"✅ Found {len(block_models)} block models in workspace", "success")
+                self.log_message("💡 Select a block model to update with litho properties", "info")
+            else:
+                self._available_block_models.options = []
+                self._available_block_models.value = ()
+                self.log_message("⚠️ No block models found in workspace", "warning")
+                self.log_message("💡 Make sure your .geoh5 file contains block model objects", "info")
+
+        except Exception as e:
+            self.log_message(f"❌ Error refreshing block models: {e}", "error")
+            import traceback
+            self.log_message(f"🔍 Details: {traceback.format_exc()}", "error")
+
+    def update_block_model_click(self, _):
+        """Update block model with litho properties from surfaces based on order"""
+        try:
+            if not self._projected_surfaces:
+                self.log_message("No projected surfaces available. Process curves first.", "warning")
+                return
+
+            if not self._available_block_models.value:
+                self.log_message("No block model selected. Please select a block model.", "warning")
+                return
+
+            self.log_message("🔄 Updating block model with litho properties...", "info")
+
+            if self.workspace is None:
+                self.log_message("No workspace loaded. Please select a project first.", "warning")
+                return
+
+            # Get the selected block model
+            block_model_uid = self._available_block_models.value[0]  # Take first selected
+            block_model = self.workspace.get_entity(block_model_uid)[0]
+
+            if block_model is None or not isinstance(block_model, BlockModel):
+                self.log_message("❌ Invalid block model selected", "error")
+                return
+
+            # Sort surfaces by order (ascending - lower order first, higher order overwrites)
+            sorted_surfaces = sorted(self._projected_surfaces,
+                                   key=lambda x: x[4][0] if x[4] is not None else 0)
+
+            # Initialize litho array for block model
+            litho_values = np.full(block_model.n_cells, np.nan)  # Start with NaN
+
+            total_cells_updated = 0
+
+            # Process each surface in order
+            for surface_idx, (vertices, cells, curve_name, litho_data, order_data) in enumerate(sorted_surfaces):
+                if litho_data is None:
+                    self.log_message(f"⚠️ Skipping surface {curve_name} - no litho data", "warning")
+                    continue
+
+                litho_value = litho_data[0]  # Use first litho value
+                order_value = order_data[0] if order_data is not None else 0
+
+                self.log_message(f"📊 Processing surface {curve_name} (order: {order_value}, litho: {litho_value})", "info")
+
+                # Find block model cells that intersect with this surface
+                intersecting_cells = self._find_intersecting_cells(block_model, vertices, cells)
+
+                if len(intersecting_cells) > 0:
+                    # Update litho values for intersecting cells (overwrites previous values)
+                    litho_values[intersecting_cells] = litho_value
+                    total_cells_updated += len(intersecting_cells)
+                    self.log_message(f"✅ Updated {len(intersecting_cells)} cells with litho value {litho_value}", "success")
+                else:
+                    self.log_message(f"⚠️ No intersecting cells found for surface {curve_name}", "warning")
+
+            # Create output workspace for the new block model
+            temp_geoh5 = f"block_model_with_litho_{time():.0f}.geoh5"
+            export_path = self.export_directory.selected_path or "."
+            ws, live_link_status = self.get_output_workspace(
+                self.live_link.value, export_path, temp_geoh5
+            )
+
+            # Create a new block model with the same structure but with litho data
+            new_block_model_name = f"{block_model.name}_with_litho_{time():.0f}"
+
+            with ws as workspace:
+                # Create new block model with same structure
+                new_block_model = BlockModel.create(
+                    workspace,
+                    name=new_block_model_name,
+                    origin=block_model.origin,
+                    u_cell_delimiters=block_model.u_cell_delimiters,
+                    v_cell_delimiters=block_model.v_cell_delimiters,
+                    z_cell_delimiters=block_model.z_cell_delimiters,
+                )
+
+                # Copy all existing data from the original block model
+                if hasattr(block_model, 'get_data_list') and block_model.get_data_list():
+                    for data_name in block_model.get_data_list():
+                        try:
+                            data_obj = block_model.get_data(data_name)[0]
+                            new_block_model.add_data({
+                                data_name: {"values": data_obj.values}
+                            })
+                            self.log_message(f"✅ Copied data '{data_name}' from original block model", "info")
+                        except Exception as e:
+                            self.log_message(f"⚠️ Could not copy data '{data_name}': {e}", "warning")
+
+                # Add the litho data from surfaces
+                if total_cells_updated > 0:
+                    new_block_model.add_data({
+                        "litho_from_surfaces": {"values": litho_values}
+                    })
+                    self.log_message(f"📊 Successfully created new block model '{new_block_model_name}' with {total_cells_updated} cells updated", "success")
+                else:
+                    self.log_message("⚠️ No cells were updated in the new block model", "warning")
+
+                # Export via live link if active
+                if live_link_status:
+                    self.log_message("Live link active - exporting to Geoscience ANALYST", "success")
+                    monitored_directory_copy(export_path, new_block_model)
+                    self.log_message("✅ New block model exported", "info")
+                else:
+                    self.log_message("New block model saved to file", "info")
+
+        except Exception as e:
+            self.log_message(f"❌ Error updating block model: {e}", "error")
+            import traceback
+            self.log_message(f"🔍 Details: {traceback.format_exc()}", "error")
+
+    def _find_intersecting_cells(self, block_model, vertices, cells):
+        """Find block model cells that intersect with the given surface using trimesh"""
+        try:
+            # Check if trimesh is available
+            if 'trimesh' not in globals():
+                self.log_message("🔄 Trimesh not available, falling back to Delaunay method", "warning")
+                return self._find_intersecting_cells_delaunay(block_model, vertices, cells)
+
+            # Get block model cell centers
+            cell_centers = block_model.centroids
+
+            # Create trimesh object from surface
+            # Convert triangle indices to the format trimesh expects
+            faces = cells.astype(int)
+
+            # Create the mesh
+            mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+
+            # Check if mesh is watertight (closed surface)
+            if not mesh.is_watertight:
+                self.log_message(f"⚠️ Surface mesh is not watertight, results may be inaccurate", "warning")
+
+            # Use trimesh to check which points are inside the mesh
+            # trimesh.contains() returns boolean array for each point
+            points_inside = mesh.contains(cell_centers)
+
+            # Get indices of cells that are inside the surface
+            intersecting_cells = np.where(points_inside)[0]
+
+            self.log_message(f"✅ Found {len(intersecting_cells)} cells inside surface using trimesh", "info")
+
+            return intersecting_cells
+
+        except Exception as e:
+            self.log_message(f"❌ Error in trimesh intersection: {e}", "error")
+            # Fallback to the old method if trimesh fails
+            self.log_message("🔄 Falling back to Delaunay method", "warning")
+            return self._find_intersecting_cells_delaunay(block_model, vertices, cells)
+
+    def _find_intersecting_cells_delaunay(self, block_model, vertices, cells):
+        """Fallback method using Delaunay triangulation for intersection testing"""
+        try:
+            # Get block model cell centers
+            cell_centers = block_model.centroids
+
+            # Create a 2D projection of the surface for intersection testing
+            # Use XY plane for horizontal surfaces (most common for geological surfaces)
+            surface_points_2d = vertices[:, :2]  # Take only X, Y coordinates
+
+            # Create Delaunay triangulation of the surface
+            try:
+                tri = Delaunay(surface_points_2d)
+            except Exception as e:
+                self.log_message(f"⚠️ Could not create Delaunay triangulation: {e}", "warning")
+                # Fall back to bounding box approach
+                return self._find_intersecting_cells_bbox(block_model, vertices, cells)
+
+            intersecting_cells = []
+
+            # Test each block model cell center
+            for cell_idx, cell_center in enumerate(cell_centers):
+                # Project cell center to 2D
+                cell_center_2d = cell_center[:2]
+
+                # Find which triangle this point belongs to
+                triangle_idx = tri.find_simplex(cell_center_2d)
+
+                if triangle_idx >= 0:  # Point is inside the triangulation
+                    # Get the actual triangle vertices in 3D
+                    triangle = cells[triangle_idx]
+                    tri_vertices_3d = vertices[triangle]
+
+                    # Check if the point is within the Z bounds of the triangle
+                    z_min = np.min(tri_vertices_3d[:, 2])
+                    z_max = np.max(tri_vertices_3d[:, 2])
+
+                    if z_min <= cell_center[2] <= z_max:
+                        # Perform 3D point-in-triangle test
+                        if self._point_in_triangle_3d(cell_center, tri_vertices_3d):
+                            intersecting_cells.append(cell_idx)
+
+            return np.array(intersecting_cells)
+
+        except Exception as e:
+            self.log_message(f"❌ Error in Delaunay intersection: {e}", "error")
+            # Fallback to bounding box method
+            self.log_message("🔄 Falling back to bounding box method", "warning")
+            return self._find_intersecting_cells_bbox(block_model, vertices, cells)
+
+    def _find_intersecting_cells_bbox(self, block_model, vertices, cells):
+        """Last resort fallback method using bounding box intersection"""
+        try:
+            cell_centers = block_model.centroids
+
+            # For each triangle in the surface, check if cell centers are inside
+            intersecting_cells = []
+
+            for triangle in cells:
+                # Get triangle vertices
+                tri_vertices = vertices[triangle]
+
+                # Use simple bounding box check
+                tri_min = np.min(tri_vertices, axis=0)
+                tri_max = np.max(tri_vertices, axis=0)
+
+                # Find cells within bounding box
+                in_bbox = np.all((cell_centers >= tri_min) & (cell_centers <= tri_max), axis=1)
+                candidate_cells = np.where(in_bbox)[0]
+
+                # For each candidate cell, check if center is inside triangle
+                for cell_idx in candidate_cells:
+                    if cell_idx not in intersecting_cells:
+                        cell_center = cell_centers[cell_idx]
+                        if self._point_in_triangle_3d(cell_center, tri_vertices):
+                            intersecting_cells.append(cell_idx)
+
+            return np.array(intersecting_cells)
+
+        except Exception as e:
+            self.log_message(f"❌ Error in bbox intersection: {e}", "error")
+            return np.array([])
+
+    def _point_in_triangle_3d(self, point, triangle_vertices):
+        """Check if a 3D point is inside a 3D triangle using barycentric coordinates"""
+        try:
+            # Get triangle vertices
+            v0, v1, v2 = triangle_vertices
+
+            # Compute vectors
+            v0v1 = v1 - v0
+            v0v2 = v2 - v0
+            v0p = point - v0
+
+            # Compute dot products
+            dot00 = np.dot(v0v2, v0v2)
+            dot01 = np.dot(v0v2, v0v1)
+            dot02 = np.dot(v0v2, v0p)
+            dot11 = np.dot(v0v1, v0v1)
+            dot12 = np.dot(v0v1, v0p)
+
+            # Compute barycentric coordinates
+            inv_denom = 1 / (dot00 * dot11 - dot01 * dot01)
+            u = (dot11 * dot02 - dot01 * dot12) * inv_denom
+            v = (dot00 * dot12 - dot01 * dot02) * inv_denom
+
+            # Check if point is in triangle
+            return (u >= 0) and (v >= 0) and (u + v <= 1)
+
+        except Exception as e:
+            self.log_message(f"❌ Error in point-in-triangle test: {e}", "error")
+            return False
 
     def on_curve_selected(self, change):
         """Handle curve selection from dropdown and populate property options"""
@@ -390,7 +698,6 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
                         dip_rad = np.radians(dip_deg)
 
                         # Calculate projection direction (perpendicular to strike, downward)
-                        strike_dir = np.array([np.sin(strike_rad), np.cos(strike_rad), 0])
                         perp_dir = np.array([-np.cos(strike_rad), np.sin(strike_rad), 0])
 
                         # Apply dip (tilt downward)
