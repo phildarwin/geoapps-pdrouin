@@ -75,7 +75,7 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
         self._output_area = Output()
 
         # Initialize projected surface data - now for multiple surfaces
-        self._projected_surfaces = []  # List of (vertices, cells, curve_name) tuples for each curve
+        self._projected_surfaces = []  # List of (vertices, cells, curve_name, litho_data, order_data) tuples for each curve
 
         # Connect button events
         self._create_point.on_click(self.create_point_click)
@@ -344,6 +344,8 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
                     # Get strike and dip data
                     strike_data = None
                     dip_data = None
+                    litho_data = None
+                    order_data = None
 
                     if hasattr(curve, 'get_data_list') and curve.get_data_list():
                         for data_name in curve.get_data_list():
@@ -351,10 +353,25 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
                                 strike_data = curve.get_data(data_name)[0].values
                             elif data_name.lower() == 'dip':
                                 dip_data = curve.get_data(data_name)[0].values
+                            elif data_name.lower() == 'litho':
+                                litho_data = curve.get_data(data_name)[0].values
+                            elif data_name.lower() == 'order':
+                                order_data = curve.get_data(data_name)[0].values
 
                     if strike_data is None or dip_data is None:
                         self.log_message(f"❌ Strike or dip data not found on curve {curve_idx + 1}", "error")
                         continue
+
+                    # Log litho and order data availability
+                    if litho_data is not None:
+                        self.log_message(f"📊 Found litho data on curve {curve_idx + 1}", "info")
+                    else:
+                        self.log_message(f"⚠️ No litho data found on curve {curve_idx + 1}", "warning")
+
+                    if order_data is not None:
+                        self.log_message(f"📊 Found order data on curve {curve_idx + 1}", "info")
+                    else:
+                        self.log_message(f"⚠️ No order data found on curve {curve_idx + 1}", "warning")
 
                     # Project each segment downward and create surfaces
                     projected_points = []
@@ -439,7 +456,7 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
                         self.log_message(f"📊 Created complete closed surface for curve {curve_idx + 1} with {len(all_vertices)} vertices and {total_triangles} triangles", "info")
 
                         # Store the surface data for this curve
-                        self._projected_surfaces.append((all_vertices, np.array(surface_cells), curve.name))
+                        self._projected_surfaces.append((all_vertices, np.array(surface_cells), curve.name, litho_data, order_data))
                         self.log_message(f"✅ Curve {curve_idx + 1} processing completed!", "success")
                     else:
                         self.log_message(f"❌ No surfaces were created for curve {curve_idx + 1}", "error")
@@ -482,7 +499,7 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
             with ws as workspace:
                 # Create separate Surface objects for each curve
                 for surface_idx, surface_data in enumerate(self._projected_surfaces):
-                    vertices, cells, curve_name = surface_data
+                    vertices, cells, curve_name, litho_data, order_data = surface_data
 
                     if len(vertices) == 0 or len(cells) == 0:
                         self.log_message(f"⚠️ Skipping empty surface for curve {curve_name}", "warning")
@@ -498,6 +515,23 @@ class CurveWithStrikeDipToSurface(ObjectDataSelection):
                         vertices=vertices,
                         cells=cells
                     )
+
+                    # Add litho and order data to the surface if available
+                    if litho_data is not None:
+                        # Create litho data array with same value for all vertices
+                        litho_values = np.full(len(vertices), litho_data[0])  # Use first litho value for all vertices
+                        surface_obj.add_data({
+                            "litho": {"values": litho_values}
+                        })
+                        self.log_message(f"✅ Added litho data to surface '{surface_name}'", "info")
+
+                    if order_data is not None:
+                        # Create order data array with same value for all vertices
+                        order_values = np.full(len(vertices), order_data[0])  # Use first order value for all vertices
+                        surface_obj.add_data({
+                            "order": {"values": order_values}
+                        })
+                        self.log_message(f"✅ Added order data to surface '{surface_name}'", "info")
 
                     created_surfaces.append(surface_name)
                     total_vertices += len(vertices)
